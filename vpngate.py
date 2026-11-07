@@ -21,6 +21,8 @@ import io
 import json
 import os
 import re
+import socket
+import ssl
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -56,22 +58,34 @@ DEFAULT_OPTIMAL_API = "https://bestcf.pages.dev/tiancheng2/all.txt"
 # 占位符检测：命中任意一个就认为用户还没配置
 PLACEHOLDER_MARKERS = ("你的", "YOUR_", "YOUR-", "example.com", "yourdomain")
 
-# 静态优选域名池（可用 EDGE_HOSTS 整体覆盖）
+# 静态入口池（可用 EDGE_HOSTS / HOSTS_ENTRY 整体覆盖）。
+#
+# 这里的地址会原样写进 nodes.txt 的 `入口#备注$节点链接` 中的「入口」位置，
+# 客户端真正拨号连的就是它，所以它必须是能回源到你自己 Worker 的 Cloudflare 边缘。
+# 因此默认只保留 Cloudflare 官方 anycast 地址 + 少量实测可用的优选域名，
+# 不再默认塞一堆来路不明的第三方优选域名（它们随时会挂，且会把整条订阅拖死）。
+# 运行时还会再过一遍 validate_edge_hosts() 实测，连不通的不会进订阅。
 DEFAULT_EDGE_HOSTS = [
-    "saas.sin.fan:443",
-    "www.mfyx.cn:443",
-    "cf.nyanya.moe:443",
-    "cf.877774.xyz:443",
-    "cdn.204910.best:443",
-    "cdn.ctn32.us.kg:443",
-    "p.etime.vip:443",
-    "cmcc.vvvv.ee:443",
-    "cfsaas.080112.xyz:443",
+    # Cloudflare 官方 anycast（与 ISP 有关，脚本会在跑的时候再筛一次）
+    "104.20.0.1:443",
+    "104.17.152.14:443",
+    "104.26.0.1:443",
+    "104.26.10.230:443",
+    "104.24.0.1:443",
+    "104.18.0.1:443",
+    "104.16.160.1:443",
+    "104.19.0.1:443",
+    "104.21.0.1:443",
+    "104.25.0.1:443",
+    "172.64.145.202:443",
+    "172.64.152.5:443",
+    "162.159.198.1:443",
+    # 少量优选域名（实测能回源，作为 IP 全被墙时的备选）
     "cdn.aneko.ink:443",
-    "hk.cf.3666888.xyz:443",
-    "best.hzample.kdns.fr:443",
+    "cfsaas.080112.xyz:443",
+    "cf.877774.xyz:443",
     "ctsg.cfyx.aliyun.20237737.xyz:443",
-    "china-unicom.cname.cloudflare.468123.xyz:443",
+    "saas.sin.fan:443",
 ]
 
 DATA_CENTER_ORG_KEYWORDS = [
@@ -161,6 +175,13 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
     if value < minimum:
         raise ConfigError(f"{name} 不能小于 {minimum}，当前值：{value}")
     return value
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
 
 
 def normalize_worker_base(raw: str) -> str:
@@ -289,6 +310,9 @@ class Config:
     min_success_ratio: float
     max_residential_per_country: int
     max_datacenter_per_country: int
+    edge_validate: bool
+    edge_pool_max: int
+    edge_probe_timeout: float
 
     @classmethod
     def load(cls) -> "Config":
@@ -323,6 +347,9 @@ class Config:
             min_success_ratio=_env_float("MIN_SUCCESS_RATIO", 0.0, minimum=0.0),
             max_residential_per_country=_env_int("MAX_RESIDENTIAL_PER_COUNTRY", 20),
             max_datacenter_per_country=_env_int("MAX_DATACENTER_PER_COUNTRY", 10),
+            edge_validate=_env_bool("EDGE_VALIDATE", True),
+            edge_pool_max=_env_int("EDGE_POOL_MAX", 12),
+            edge_probe_timeout=_env_float("EDGE_PROBE_TIMEOUT", 5.0, minimum=1.0),
         )
 
 
@@ -746,21 +773,145 @@ def fetch_optimal_endpoints(cfg: Config, session: requests.Session) -> list[str]
     return endpoints
 
 
+def split_endpoint(endpoint: str) -> tuple[str, int] | None:
+    """把 `host:port` / `[v6]:port` 拆成 (host, port)。"""
+    text = (endpoint or "").strip()
+    if not text:
+        return None
+    if text.startswith("["):
+        match = re.fullmatch(r"\[([0-9A-Fa-f:.]+)\]:(\d{1,5})", text)
+        if not match:
+            return None
+        return match.group(1), int(match.group(2))
+    if ":" not in text:
+        return text, 443
+    host, _, port = text.rpartition(":")
+    if not host or not port.isdigit():
+        return None
+    return host, int(port)
+
+
+def probe_entry(endpoint: str, sni: str, timeout: float) -> float | None:
+    """连到入口地址、用 Worker 域名做 SNI 发一次极小的 HTTP 请求。
+
+    这一步校验的就是 nodes.txt 里 `#` 前面那段地址：它必须能真正回源到你的
+    Worker，订阅里的节点才连得上。返回耗时(ms)，失败返回 None。
+    """
+    parsed = split_endpoint(endpoint)
+    if not parsed:
+        return None
+    host, port = parsed
+    started = time.monotonic()
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            with context.wrap_socket(raw, server_hostname=sni) as tls:
+                request = (
+                    "GET /robots.txt HTTP/1.1\r\n"
+                    f"Host: {sni}\r\n"
+                    "User-Agent: gate-checker\r\n"
+                    "Connection: close\r\n\r\n"
+                )
+                tls.sendall(request.encode())
+                head = tls.recv(64)
+        if not head.startswith(b"HTTP/"):
+            return None
+        status = int(head.split(b" ")[1])
+        # 403 说明这个边缘不认我们的 SNI（多半是别人的私有优选域名），5xx 同理
+        if status == 403 or status >= 500:
+            return None
+        return round((time.monotonic() - started) * 1000, 1)
+    except Exception:  # noqa: BLE001 - 单个入口失败不影响整体
+        return None
+
+
+def validate_edge_hosts(endpoints: Iterable[str], sni: str, cfg: Config) -> dict[str, float]:
+    """并发实测入口池，返回 {入口: 耗时ms}，只包含能回源到 Worker 的地址。"""
+    targets = list(dict.fromkeys(endpoints))
+    if not targets:
+        return {}
+
+    alive: dict[str, float] = {}
+    dead: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(16, len(targets))) as pool:
+        futures = {pool.submit(probe_entry, ep, sni, cfg.edge_probe_timeout): ep for ep in targets}
+        for future in as_completed(futures):
+            endpoint = futures[future]
+            latency = future.result()
+            if latency is None:
+                dead.append(endpoint)
+            else:
+                alive[endpoint] = latency
+
+    log("EDGE POOL", f"入口校验: 候选 {len(targets)} 个, 可用 {len(alive)} 个, 剔除 {len(dead)} 个")
+    if dead:
+        preview = ", ".join(sorted(dead)[:8]) + (" …" if len(dead) > 8 else "")
+        log("EDGE POOL", f"已剔除不可用入口: {preview}")
+    return alive
+
+
 def get_combined_edge_hosts(cfg: Config, session: requests.Session) -> list[str]:
+    """静态池 + 优选 API 合并，实测校验后生成最终入口池。
+
+    排序原则：
+      1. 静态池（你自己配的、已知可靠的 Cloudflare 边缘）优先，按实测耗时排序；
+      2. 优选 API 的端点只用于补位，且同一 host 只取一个端口，避免整池都是同一台机器；
+      3. Worker 自己的域名永远放最后兜底——它一定通，只是没有优选加速。
+    """
     api_endpoints = fetch_optimal_endpoints(cfg, session)
-    combined: list[str] = []
+    static_hosts = list(cfg.edge_hosts)
+
+    candidates: list[str] = []
     seen: set[str] = set()
-    for endpoint in list(cfg.edge_hosts) + api_endpoints:
+    for endpoint in static_hosts + api_endpoints:
         if endpoint and endpoint not in seen:
             seen.add(endpoint)
-            combined.append(endpoint)
-    if not combined:  # 双保险：静态池在 Config 里已兜底，这里再兜一次
-        combined = [h for h in (normalize_endpoint(x) for x in DEFAULT_EDGE_HOSTS) if h]
+            candidates.append(endpoint)
+
+    worker_host = urlsplit(cfg.worker_base).hostname or ""
+    fallback = f"{worker_host}:443" if worker_host else ""
+
+    if cfg.edge_validate and worker_host:
+        alive = validate_edge_hosts(candidates, worker_host, cfg)
+    else:
+        log("EDGE POOL", "EDGE_VALIDATE=0，跳过入口实测")
+        alive = {endpoint: 0.0 for endpoint in candidates}
+
+    static_alive = sorted((ep for ep in static_hosts if ep in alive), key=lambda ep: alive[ep])
+    pool: list[str] = list(static_alive)
+
+    used_hosts: set[str] = set()
+    for endpoint in pool:
+        parsed = split_endpoint(endpoint)
+        if parsed:
+            used_hosts.add(parsed[0])
+
+    for endpoint in sorted((ep for ep in api_endpoints if ep in alive), key=lambda ep: alive[ep]):
+        parsed = split_endpoint(endpoint)
+        if not parsed or parsed[0] in used_hosts:
+            continue
+        used_hosts.add(parsed[0])
+        pool.append(endpoint)
+
+    if cfg.edge_pool_max > 0:
+        pool = pool[: cfg.edge_pool_max]
+
+    if not pool:
+        if not fallback:
+            raise ConfigError("优选入口池为空，无法生成 nodes.txt")
+        log("EDGE POOL", f"所有候选入口均不可用，回退到 Worker 域名 {fallback}")
+        pool = [fallback]
+    elif fallback and fallback not in pool:
+        pool.append(fallback)
+
     log(
         "EDGE POOL",
-        f"入口地址池: 静态/配置 {len(cfg.edge_hosts)} 个, API {len(api_endpoints)} 个, 合并 {len(combined)} 个",
+        f"静态/配置 {len(static_hosts)} 个 + API {len(api_endpoints)} 个 -> 最终入口池 {len(pool)} 个",
     )
-    return combined
+    log("EDGE POOL", "入口池: " + ", ".join(pool))
+    return pool
 
 
 # ---------------------------------------------------------------------------
@@ -895,7 +1046,9 @@ def write_outputs(
     return data_path, html_path, nodes_path, nodes_text
 
 
-def write_step_summary(data: dict[str, Any], nodes_count: int, cfg: Config) -> None:
+def write_step_summary(
+    data: dict[str, Any], nodes_count: int, edge_hosts: list[str], cfg: Config
+) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
     if not summary_path:
         return
@@ -910,6 +1063,7 @@ def write_step_summary(data: dict[str, Any], nodes_count: int, cfg: Config) -> N
         f"| 国家/地区 | {stats['countries']} |\n",
         f"| 住宅 / 机房 / 未知 | {stats['residential_est']} / {stats['datacenter_est']} / {stats['unknown_est']} |\n",
         f"| 发布节点行数 | {nodes_count} |\n",
+        f"| 入口池（实测可用）| {len(edge_hosts)} 个 |\n",
         f"| 用时 | {data['duration_s']}s |\n",
         f"| 数据源 | {data['source']} |\n",
     ]
@@ -997,7 +1151,7 @@ def main() -> None:
     log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(nodes_path, REPO_DIR)}")
     log("USAGE", f"把 {cfg.nodes_url} 填入 edgetunnel 后台「自定义优选 IP」")
-    write_step_summary(data, nodes_count, cfg)
+    write_step_summary(data, nodes_count, edge_hosts, cfg)
     log("WEBSITE", "完成（GitHub Pages 部署由 workflow 执行）")
 
 
